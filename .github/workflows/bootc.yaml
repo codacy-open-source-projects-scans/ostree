@@ -22,7 +22,7 @@ jobs:
       matrix:
         stream: [stream9, stream10]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Installdeps
         run: sudo apt update && sudo apt install just
       - name: Get a newer podman for heredoc support (from debian testing)
