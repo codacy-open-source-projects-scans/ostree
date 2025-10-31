@@ -48,7 +48,7 @@ jobs:
           sudo ls -dZ /ostree/deploy/default/deploy/*.0/etc |grep :etc_t:
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-suite-log-${{ matrix.stream }}
           path: target/unittest
