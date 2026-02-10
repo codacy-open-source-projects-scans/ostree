@@ -197,11 +197,16 @@ deployment_write_json (OstreeSysroot *sysroot, OstreeRepo *repo, OstreeDeploymen
                        gboolean is_booted, gboolean is_pending, gboolean is_rollback,
                        struct ul_jsonwrt *jo, GCancellable *cancellable, GError **error)
 {
+  GKeyFile *origin = ostree_deployment_get_origin (deployment);
+  g_autofree char *origin_refspec
+      = origin ? g_key_file_get_string (origin, "origin", "refspec", NULL) : NULL;
+
   ul_jsonwrt_object_open (jo, NULL);
 
   const char *ref = ostree_deployment_get_csum (deployment);
   ul_jsonwrt_value_s (jo, "checksum", ref);
   ul_jsonwrt_value_s (jo, "stateroot", ostree_deployment_get_osname (deployment));
+  ul_jsonwrt_value_s (jo, "refspec", origin_refspec);
   ul_jsonwrt_value_u64 (jo, "serial", ostree_deployment_get_deployserial (deployment));
   ul_jsonwrt_value_u64 (jo, "index", ostree_deployment_get_index (deployment));
   ul_jsonwrt_value_boolean (jo, "booted", is_booted);
