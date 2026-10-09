@@ -181,7 +181,8 @@ ot_security_smack_reset_fd (int fd)
 /* Given an O_TMPFILE regular file, link it into place. */
 gboolean
 _ostree_repo_commit_tmpf_final (OstreeRepo *self, const char *checksum, OstreeObjectType objtype,
-                                GLnxTmpfile *tmpf, GCancellable *cancellable, GError **error)
+                                GLnxTmpfile *tmpf, gboolean *out_existed, GCancellable *cancellable,
+                                GError **error)
 {
   char tmpbuf[_OSTREE_LOOSE_PATH_MAX];
   _ostree_loose_path (tmpbuf, checksum, objtype, self->mode);
@@ -193,10 +194,19 @@ _ostree_repo_commit_tmpf_final (OstreeRepo *self, const char *checksum, OstreeOb
   if (!_ostree_tmpf_fsverity (self, tmpf, NULL, error))
     return FALSE;
 
-  if (!glnx_link_tmpfile_at (tmpf, GLNX_LINK_TMPFILE_NOREPLACE_IGNORE_EXIST, dest_dfd, tmpbuf,
-                             error))
-    return FALSE;
-  /* We're done with the fd */
+  gboolean existed = FALSE;
+  g_autoptr (GError) local_error = NULL;
+  if (!glnx_link_tmpfile_at (tmpf, GLNX_LINK_TMPFILE_NOREPLACE, dest_dfd, tmpbuf, &local_error))
+    {
+      if (!g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_EXISTS))
+        {
+          g_propagate_error (error, g_steal_pointer (&local_error));
+          return FALSE;
+        }
+      existed = TRUE;
+    }
+  if (out_existed)
+    *out_existed = existed;
   glnx_tmpfile_clear (tmpf);
   return TRUE;
 }
@@ -237,8 +247,8 @@ commit_path_final (OstreeRepo *self, const char *checksum, OstreeObjectType objt
  */
 static gboolean
 commit_loose_regfile_object (OstreeRepo *self, const char *checksum, GLnxTmpfile *tmpf, guint32 uid,
-                             guint32 gid, guint32 mode, GVariant *xattrs, GCancellable *cancellable,
-                             GError **error)
+                             guint32 gid, guint32 mode, GVariant *xattrs, gboolean *out_existed,
+                             GCancellable *cancellable, GError **error)
 {
   if (self->mode == OSTREE_REPO_MODE_BARE)
     {
@@ -308,8 +318,8 @@ commit_loose_regfile_object (OstreeRepo *self, const char *checksum, GLnxTmpfile
         return glnx_throw_errno_prefix (error, "fsync");
     }
 
-  if (!_ostree_repo_commit_tmpf_final (self, checksum, OSTREE_OBJECT_TYPE_FILE, tmpf, cancellable,
-                                       error))
+  if (!_ostree_repo_commit_tmpf_final (self, checksum, OSTREE_OBJECT_TYPE_FILE, tmpf, out_existed,
+                                       cancellable, error))
     return FALSE;
 
   return TRUE;
@@ -462,7 +472,7 @@ throw_min_free_space_error (OstreeRepo *self, guint64 bytes_required, GError **e
     err_msg = "would be exceeded";
   (void)err_msg_owned; // Conditional ownership
 
-  if (self->min_free_space_mb > 0)
+  if (!self->min_free_space_use_percent)
     return glnx_throw (error, "min-free-space-size %" G_GUINT64_FORMAT "MB %s",
                        self->min_free_space_mb, err_msg);
   else
@@ -540,6 +550,7 @@ _ostree_repo_bare_content_commit (OstreeRepo *self, OstreeRepoBareContent *barew
   OstreeRealRepoBareContent *real = (OstreeRealRepoBareContent *)barewrite;
   g_assert (real->initialized);
 
+  fsblkcnt_t object_blocks_reserved = 0;
   if ((self->min_free_space_percent > 0 || self->min_free_space_mb > 0) && self->in_transaction)
     {
       struct stat st_buf;
@@ -549,15 +560,15 @@ _ostree_repo_bare_content_commit (OstreeRepo *self, OstreeRepoBareContent *barew
       g_mutex_lock (&self->txn_lock);
       g_assert_cmpint (self->txn.blocksize, >, 0);
 
-      const fsblkcnt_t object_blocks = (st_buf.st_size / self->txn.blocksize) + 1;
-      if (object_blocks > self->txn.max_blocks)
+      object_blocks_reserved = (st_buf.st_size / self->txn.blocksize) + 1;
+      if (object_blocks_reserved > self->txn.max_blocks)
         {
           self->cleanup_stagedir = TRUE;
           g_mutex_unlock (&self->txn_lock);
           return throw_min_free_space_error (self, st_buf.st_size, error);
         }
       /* This is the main bit that needs mutex protection */
-      self->txn.max_blocks -= object_blocks;
+      self->txn.max_blocks -= object_blocks_reserved;
       g_mutex_unlock (&self->txn_lock);
     }
 
@@ -568,9 +579,19 @@ _ostree_repo_bare_content_commit (OstreeRepo *self, OstreeRepoBareContent *barew
                                            checksum_buf, error))
     return FALSE;
 
+  gboolean obj_existed;
   if (!commit_loose_regfile_object (self, checksum_buf, &real->tmpf, real->uid, real->gid,
-                                    real->mode, real->xattrs, cancellable, error))
+                                    real->mode, real->xattrs, &obj_existed, cancellable, error))
     return FALSE;
+  /* If the object already existed, credit back the space reservation we
+   * made above — no new disk space was consumed.
+   */
+  if (obj_existed)
+    {
+      g_mutex_lock (&self->txn_lock);
+      self->txn.max_blocks += object_blocks_reserved;
+      g_mutex_unlock (&self->txn_lock);
+    }
 
   /* Let's have a guarantee that after commit the object is cleaned up */
   _ostree_repo_bare_content_cleanup (barewrite);
@@ -596,8 +617,8 @@ _ostree_repo_bare_content_cleanup (OstreeRepoBareContent *regwrite)
 static gboolean
 create_regular_tmpfile_linkable_with_content (OstreeRepo *self, guint64 length,
                                               GInputStream *original_input, GInputStream *input,
-                                              GLnxTmpfile *out_tmpf, GCancellable *cancellable,
-                                              GError **error)
+                                              GLnxTmpfile *out_tmpf, gboolean *out_was_reflinked,
+                                              GCancellable *cancellable, GError **error)
 {
   g_auto (GLnxTmpfile) tmpf = {
     0,
@@ -649,6 +670,8 @@ create_regular_tmpfile_linkable_with_content (OstreeRepo *self, guint64 length,
   if (!glnx_fchmod (tmpf.fd, 0644, error))
     return FALSE;
 
+  if (out_was_reflinked)
+    *out_was_reflinked = did_clone;
   *out_tmpf = tmpf;
   tmpf.initialized = FALSE;
   return TRUE;
@@ -959,21 +982,28 @@ write_content_object (OstreeRepo *self, const char *expected_checksum, GInputStr
 
   (void)file_input_owned; // Conditionally owned
 
-  /* Free space check; only applies during transactions */
+  /* Free space check; only applies during transactions.
+   *
+   * We optimistically reserve space here before we know the object's
+   * checksum.  If we later discover the object already exists in the repo
+   * (i.e. it is a duplicate), we credit the reservation back — see the
+   * have_obj block below.
+   */
+  fsblkcnt_t object_blocks_reserved = 0;
   if ((self->min_free_space_percent > 0 || self->min_free_space_mb > 0) && self->in_transaction)
     {
       g_mutex_lock (&self->txn_lock);
       g_assert_cmpint (self->txn.blocksize, >, 0);
-      const fsblkcnt_t object_blocks = (size / self->txn.blocksize) + 1;
-      if (object_blocks > self->txn.max_blocks)
+      object_blocks_reserved = (size / self->txn.blocksize) + 1;
+      if (object_blocks_reserved > self->txn.max_blocks)
         {
-          guint64 bytes_required = (guint64)object_blocks * self->txn.blocksize;
+          guint64 bytes_required = (guint64)object_blocks_reserved * self->txn.blocksize;
           self->cleanup_stagedir = TRUE;
           g_mutex_unlock (&self->txn_lock);
           return throw_min_free_space_error (self, bytes_required, error);
         }
       /* This is the main bit that needs mutex protection */
-      self->txn.max_blocks -= object_blocks;
+      self->txn.max_blocks -= object_blocks_reserved;
       g_mutex_unlock (&self->txn_lock);
     }
 
@@ -1004,9 +1034,23 @@ write_content_object (OstreeRepo *self, const char *expected_checksum, GInputStr
     }
   else if (repo_mode != OSTREE_REPO_MODE_ARCHIVE)
     {
+      gboolean was_reflinked = FALSE;
       if (!create_regular_tmpfile_linkable_with_content (self, size, input, file_input, &tmpf,
-                                                         cancellable, error))
+                                                         &was_reflinked, cancellable, error))
         return FALSE;
+      /* We got a reflink, so we're not actually paying for data here. Credit back max_block
+       * reservation. In theory, we're still paying for inode metadata, but that's a variable cost
+       * depending on the actual filesystem. E.g. xfs allocates from a separate pool, not from data
+       * blocks, so it truly doesn't consume f_bavail. btrfs OTOH would but it wouldn't even cost a
+       * whole block. Trying to get this exactly right is probably not worth it since the actual
+       * amount is still trivial.
+       */
+      if (was_reflinked && object_blocks_reserved > 0)
+        {
+          g_mutex_lock (&self->txn_lock);
+          self->txn.max_blocks += object_blocks_reserved;
+          g_mutex_unlock (&self->txn_lock);
+        }
     }
   else
     {
@@ -1100,11 +1144,14 @@ write_content_object (OstreeRepo *self, const char *expected_checksum, GInputStr
   if (!_ostree_repo_has_loose_object (self, actual_checksum, OSTREE_OBJECT_TYPE_FILE, &have_obj,
                                       cancellable, error))
     return FALSE;
-  /* If we already have it, just update the stats. */
+  /* If we already have it, just update the stats.  Also credit back the
+   * free-space reservation we made above — no new disk space was consumed.
+   */
   if (have_obj)
     {
       g_mutex_lock (&self->txn_lock);
       self->txn.stats.content_objects_total++;
+      self->txn.max_blocks += object_blocks_reserved;
       g_mutex_unlock (&self->txn_lock);
 
       if (!_create_payload_link (self, actual_checksum, actual_payload_checksum, file_info,
@@ -1168,7 +1215,7 @@ write_content_object (OstreeRepo *self, const char *expected_checksum, GInputStr
         return FALSE;
 
       /* This path is for regular files */
-      if (!commit_loose_regfile_object (self, actual_checksum, &tmpf, uid, gid, mode, xattrs,
+      if (!commit_loose_regfile_object (self, actual_checksum, &tmpf, uid, gid, mode, xattrs, NULL,
                                         cancellable, error))
         return FALSE;
 
@@ -1389,7 +1436,8 @@ write_metadata_object (OstreeRepo *self, OstreeObjectType objtype, const char *e
     return FALSE;
 
   /* And commit it into place */
-  if (!_ostree_repo_commit_tmpf_final (self, actual_checksum, objtype, &tmpf, cancellable, error))
+  if (!_ostree_repo_commit_tmpf_final (self, actual_checksum, objtype, &tmpf, NULL, cancellable,
+                                       error))
     return FALSE;
 
   if (objtype == OSTREE_OBJECT_TYPE_COMMIT)
@@ -1801,9 +1849,34 @@ rename_pending_loose_objects (OstreeRepo *self, GCancellable *cancellable, GErro
                                                     cancellable, error))
             return FALSE;
 
-          if (!glnx_renameat (child_dfd_iter.fd, loose_objpath + 3, self->objects_dir_fd,
-                              loose_objpath, error))
-            return FALSE;
+          /* For content-addressed objects, use RENAME_NOREPLACE so that an
+           * existing object keeps its inode.  If the destination already
+           * exists (EEXIST) the content is identical by definition, so just
+           * drop the staging copy.
+           *
+           * Exception: .commitmeta objects are keyed by commit checksum, not
+           * by their own content, so they can be updated in place (e.g. when
+           * GPG signatures are added or deleted).  Always overwrite those.
+           */
+          if (g_str_has_suffix (child_dent->d_name, ".commitmeta"))
+            {
+              if (!glnx_renameat (child_dfd_iter.fd, loose_objpath + 3, self->objects_dir_fd,
+                                  loose_objpath, error))
+                return FALSE;
+            }
+          else if (glnx_renameat2_noreplace (child_dfd_iter.fd, loose_objpath + 3,
+                                             self->objects_dir_fd, loose_objpath)
+                   < 0)
+            {
+              if (errno == EEXIST)
+                {
+                  /* Object already present with same content; drop staging copy */
+                  if (!glnx_unlinkat (child_dfd_iter.fd, loose_objpath + 3, 0, error))
+                    return FALSE;
+                }
+              else
+                return glnx_throw_errno_prefix (error, "renameat2(noreplace, %s)", loose_objpath);
+            }
         }
     }
 
@@ -4441,8 +4514,8 @@ import_one_object_direct (OstreeRepo *dest_repo, OstreeRepo *src_repo, const cha
           (void)futimens (tmp_dest.fd, ts);
         }
 
-      if (!_ostree_repo_commit_tmpf_final (dest_repo, checksum, objtype, &tmp_dest, cancellable,
-                                           error))
+      if (!_ostree_repo_commit_tmpf_final (dest_repo, checksum, objtype, &tmp_dest, NULL,
+                                           cancellable, error))
         return FALSE;
     }
 

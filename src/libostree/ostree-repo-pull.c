@@ -91,6 +91,7 @@ typedef struct
   char *to_revision;
   guint i;
   guint64 size;
+  guint64 usize;
   guint n_retries_remaining;
 } FetchStaticDeltaData;
 
@@ -952,8 +953,8 @@ content_fetch_on_complete (GObject *object, GAsyncResult *result, gpointer user_
   if (pull_data->trusted_http_direct)
     {
       g_assert (!verifying_bareuseronly);
-      if (!_ostree_repo_commit_tmpf_final (pull_data->repo, checksum, objtype, &tmpf, cancellable,
-                                           error))
+      if (!_ostree_repo_commit_tmpf_final (pull_data->repo, checksum, objtype, &tmpf, NULL,
+                                           cancellable, error))
         goto out;
       pull_data->n_fetched_content++;
     }
@@ -2201,6 +2202,7 @@ process_one_static_delta (OtPullData *pull_data, const char *from_revision, cons
       fetch_data->objects = g_variant_ref (objects);
       fetch_data->expected_checksum = ostree_checksum_from_bytes_v (csum_v);
       fetch_data->size = size;
+      fetch_data->usize = usize;
       fetch_data->i = i;
       fetch_data->n_retries_remaining = pull_data->n_network_retries;
 

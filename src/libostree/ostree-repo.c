@@ -687,8 +687,6 @@ ostree_repo_auto_lock_cleanup (OstreeRepoAutoLock *auto_lock)
 /**
  * _ostree_repo_auto_transaction_new:
  * @repo: (not nullable): an #OsreeRepo object
- * @cancellable: Cancellable
- * @error: a #GError
  *
  * Return a guard for a transaction in @repo.
  *
@@ -2417,7 +2415,7 @@ out:
 
   return ret;
 #else  /* OSTREE_DISABLE_GPGME */
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -2535,7 +2533,7 @@ ostree_repo_remote_get_gpg_keys (OstreeRepo *self, const char *name, const char 
 
   return TRUE;
 #else  /* OSTREE_DISABLE_GPGME */
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -2967,6 +2965,9 @@ min_free_space_calculate_reserved_bytes (OstreeRepo *self, guint64 *bytes, GErro
   if (TEMP_FAILURE_RETRY (fstatvfs (self->repo_dir_fd, &stvfsbuf)) < 0)
     return glnx_throw_errno_prefix (error, "fstatvfs");
 
+  guint64 reserved_from_mb = 0;
+  guint64 reserved_from_pct = 0;
+
   if (self->min_free_space_mb > 0)
     {
       if (self->min_free_space_mb > (G_MAXUINT64 >> 20))
@@ -2976,9 +2977,10 @@ min_free_space_calculate_reserved_bytes (OstreeRepo *self, guint64 *bytes, GErro
             " bytes",
             (G_MAXUINT64 >> 20));
 
-      reserved_bytes = self->min_free_space_mb << 20;
+      reserved_from_mb = self->min_free_space_mb << 20;
     }
-  else if (self->min_free_space_percent > 0)
+
+  if (self->min_free_space_percent > 0)
     {
       if (stvfsbuf.f_frsize > (G_MAXUINT64 / stvfsbuf.f_blocks))
         return glnx_throw (
@@ -2988,7 +2990,34 @@ min_free_space_calculate_reserved_bytes (OstreeRepo *self, guint64 *bytes, GErro
             (G_MAXUINT64 / stvfsbuf.f_blocks));
 
       guint64 total_bytes = (stvfsbuf.f_frsize * stvfsbuf.f_blocks);
-      reserved_bytes = ((double)total_bytes) * (self->min_free_space_percent / 100.0);
+      reserved_from_pct = ((double)total_bytes) * (self->min_free_space_percent / 100.0);
+    }
+
+  /* When both percentage and absolute limits are set, use the smaller of the two,
+   * and keep track of which one supplied the limit so that the error path can
+   * report the limit that was actually enforced. */
+  if (reserved_from_mb > 0 && reserved_from_pct > 0)
+    {
+      if (reserved_from_mb <= reserved_from_pct)
+        {
+          reserved_bytes = reserved_from_mb;
+          self->min_free_space_use_percent = FALSE;
+        }
+      else
+        {
+          reserved_bytes = reserved_from_pct;
+          self->min_free_space_use_percent = TRUE;
+        }
+    }
+  else if (reserved_from_mb > 0)
+    {
+      reserved_bytes = reserved_from_mb;
+      self->min_free_space_use_percent = FALSE;
+    }
+  else
+    {
+      reserved_bytes = reserved_from_pct;
+      self->min_free_space_use_percent = TRUE;
     }
 
   *bytes = reserved_bytes;
@@ -3150,10 +3179,14 @@ reload_core_config (OstreeRepo *self, GCancellable *cancellable, GError **error)
   }
 
   {
-    /* Try to parse both min-free-space-* config options first. If both are absent, fallback on 3%
-     * free space. If both are present and are non-zero, use min-free-space-size unconditionally
-     * and display a warning.
+    /* Parse both min-free-space-* config options. Reset the cached values first so
+     * that a config reload doesn't retain stale limits from a previous load. If both
+     * options are absent, fall back to min(3%, 1GB). When both are set and non-zero,
+     * the smaller of the two limits is enforced (see
+     * min_free_space_calculate_reserved_bytes()).
      */
+    self->min_free_space_percent = 0;
+    self->min_free_space_mb = 0;
     if (g_key_file_has_key (self->config, "core", "min-free-space-size", NULL))
       {
         g_autofree char *min_free_space_size_str = NULL;
@@ -3176,6 +3209,14 @@ reload_core_config (OstreeRepo *self, GCancellable *cancellable, GError **error)
                                                 NULL, &min_free_space_percent_str, error))
           return FALSE;
 
+        /* Validate that the string contains only digits */
+        for (const char *p = min_free_space_percent_str; *p; p++)
+          {
+            if (!g_ascii_isdigit (*p))
+              return glnx_throw (error, "Invalid min-free-space-percent '%s': must be a number",
+                                 min_free_space_percent_str);
+          }
+
         self->min_free_space_percent = g_ascii_strtoull (min_free_space_percent_str, NULL, 10);
         if (self->min_free_space_percent > 99)
           return glnx_throw (error, "Invalid min-free-space-percent '%s'",
@@ -3183,17 +3224,17 @@ reload_core_config (OstreeRepo *self, GCancellable *cancellable, GError **error)
       }
     else if (!g_key_file_has_key (self->config, "core", "min-free-space-size", NULL))
       {
-        /* Default fallback of 3% free space. If changing this, be sure to change the man page too
+        /* Default fallback of min(3%, 1GB) free space.
+         * If changing this, be sure to change the man page too.
          */
         self->min_free_space_percent = 3;
-        self->min_free_space_mb = 0;
+        self->min_free_space_mb = 1024;
       }
 
     if (self->min_free_space_percent != 0 && self->min_free_space_mb != 0)
       {
-        self->min_free_space_percent = 0;
-        g_debug ("Both min-free-space-percent and -size are mentioned in config. Enforcing "
-                 "min-free-space-size check only.");
+        g_debug ("Both min-free-space-percent and -size are mentioned in config. "
+                 "Using the minimum of the two for free space checks.");
       }
   }
 
@@ -5150,7 +5191,7 @@ ostree_repo_append_gpg_signature (OstreeRepo *self, const gchar *commit_checksum
 
   return TRUE;
 #else
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -5287,7 +5328,7 @@ ostree_repo_sign_commit (OstreeRepo *self, const gchar *commit_checksum, const g
   return TRUE;
 #else
   /* FIXME: Return false until refactoring */
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -5357,7 +5398,7 @@ _ostree_repo_add_gpg_signature_summary_at (OstreeRepo *self, int dir_fd, const g
 
   return TRUE;
 #else
-  return glnx_throw (error, "GPG feature is disabled at build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -5379,7 +5420,7 @@ ostree_repo_add_gpg_signature_summary (OstreeRepo *self, const gchar **key_id, c
   return _ostree_repo_add_gpg_signature_summary_at (self, self->repo_dir_fd, key_id, homedir,
                                                     cancellable, error);
 #else
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -5432,7 +5473,7 @@ ostree_repo_gpg_sign_data (OstreeRepo *self, GBytes *data, GBytes *old_signature
   *out_signatures = g_variant_get_data_as_bytes (res);
   return TRUE;
 #else
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -5676,7 +5717,7 @@ ostree_repo_verify_commit (OstreeRepo *self, const gchar *commit_checksum, GFile
   return TRUE;
 #else
   /* FIXME: Return false until refactoring */
-  return glnx_throw (error, "GPG feature is disabled in a build time");
+  return glnx_throw (error, "GPG has been disabled at build time");
 #endif /* OSTREE_DISABLE_GPGME */
 }
 
@@ -5702,7 +5743,7 @@ ostree_repo_verify_commit_ext (OstreeRepo *self, const gchar *commit_checksum, G
   return _ostree_repo_verify_commit_internal (self, commit_checksum, NULL, keyringdir,
                                               extra_keyring, cancellable, error);
 #else
-  glnx_throw (error, "GPG feature is disabled in a build time");
+  glnx_throw (error, "GPG has been disabled at build time");
   return NULL;
 #endif /* OSTREE_DISABLE_GPGME */
 }
@@ -5732,7 +5773,7 @@ ostree_repo_verify_commit_for_remote (OstreeRepo *self, const gchar *commit_chec
   return _ostree_repo_verify_commit_internal (self, commit_checksum, remote_name, NULL, NULL,
                                               cancellable, error);
 #else
-  glnx_throw (error, "GPG feature is disabled in a build time");
+  glnx_throw (error, "GPG has been disabled at build time");
   return NULL;
 #endif /* OSTREE_DISABLE_GPGME */
 }
@@ -5772,7 +5813,7 @@ ostree_repo_gpg_verify_data (OstreeRepo *self, const gchar *remote_name, GBytes 
       self, (remote_name != NULL) ? remote_name : OSTREE_ALL_REMOTES, data, signatures, keyringdir,
       extra_keyring, cancellable, error);
 #else
-  glnx_throw (error, "GPG feature is disabled in a build time");
+  glnx_throw (error, "GPG has been disabled at build time");
   return NULL;
 #endif /* OSTREE_DISABLE_GPGME */
 }
@@ -5809,7 +5850,53 @@ ostree_repo_verify_summary (OstreeRepo *self, const char *remote_name, GBytes *s
   return _ostree_repo_gpg_verify_with_metadata (self, summary, signatures_variant, remote_name,
                                                 NULL, NULL, cancellable, error);
 #else
-  glnx_throw (error, "GPG feature is disabled in a build time");
+  glnx_throw (error, "GPG has been disabled at build time");
+  return NULL;
+#endif /* OSTREE_DISABLE_GPGME */
+}
+
+/**
+ * ostree_repo_verify_local_summary:
+ * @self: Repo
+ * @summary: Summary data as a #GBytes
+ * @signatures: Summary signatures as a #GBytes
+ * @keyringdir: (nullable): Path to directory GPG keyrings; overrides built-in default if given
+ * @extra_keyring: (nullable): Path to additional keyring file (not a directory)
+ * @cancellable: Cancellable
+ * @error: Error
+ *
+ * Verify @signatures for @summary data using GPG keys in the given keyring (GPG
+ * homedir), and return an #OstreeGpgVerifyResult.
+ *
+ * This is intended to be used on a server repository, for verifying the
+ * signatures on the summary file it exports. Use ostree_repo_verify_summary()
+ * to verify the summary file from a configured remote in a repository.
+ *
+ * Returns: (transfer full): an #OstreeGpgVerifyResult, or %NULL on error
+ */
+OstreeGpgVerifyResult *
+ostree_repo_verify_local_summary (OstreeRepo *self, GBytes *summary, GBytes *signatures,
+                                  GFile *keyringdir, GFile *extra_keyring,
+                                  GCancellable *cancellable, GError **error)
+{
+  g_autoptr (GVariant) signatures_variant = NULL;
+
+  g_return_val_if_fail (OSTREE_IS_REPO (self), NULL);
+  g_return_val_if_fail (summary != NULL, NULL);
+  g_return_val_if_fail (signatures != NULL, NULL);
+  g_return_val_if_fail (keyringdir == NULL || G_IS_FILE (keyringdir), NULL);
+  g_return_val_if_fail (extra_keyring == NULL || G_IS_FILE (extra_keyring), NULL);
+  g_return_val_if_fail (cancellable == NULL || G_IS_CANCELLABLE (cancellable), NULL);
+  g_return_val_if_fail (error == NULL || *error == NULL, NULL);
+
+  signatures_variant
+      = g_variant_new_from_bytes (OSTREE_SUMMARY_SIG_GVARIANT_FORMAT, signatures, FALSE);
+
+#ifndef OSTREE_DISABLE_GPGME
+  return _ostree_repo_gpg_verify_with_metadata (self, summary, signatures_variant, NULL, keyringdir,
+                                                extra_keyring, cancellable, error);
+#else
+  glnx_throw (error, "GPG has been disabled at build time");
   return NULL;
 #endif /* OSTREE_DISABLE_GPGME */
 }

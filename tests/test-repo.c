@@ -26,9 +26,13 @@
 #include <glib-object.h>
 #include <glib.h>
 #include <libglnx.h>
+#include <linux/fs.h>
 #include <locale.h>
+#include <sys/ioctl.h>
+#include <sys/statvfs.h>
 
 #include "ostree-autocleanups.h"
+#include "ostree-repo-private.h"
 #include "ostree-types.h"
 
 /* Test fixture. Creates a temporary directory. */
@@ -541,6 +545,277 @@ test_repo_lock_multi_thread (Fixture *fixture, gconstpointer test_data)
   g_thread_join (thread2);
 }
 
+/* Test that writing duplicate content objects within a single transaction does
+ * not spuriously trigger the min-free-space check.
+ */
+static guint64
+expected_min_free_space_bytes (OstreeRepo *repo)
+{
+  struct statvfs stvfsbuf;
+  if (TEMP_FAILURE_RETRY (fstatvfs (repo->repo_dir_fd, &stvfsbuf)) < 0)
+    g_assert_not_reached ();
+
+  /* Mirrors min_free_space_calculate_reserved_bytes(): the smaller of the two
+   * configured limits is enforced. */
+  guint64 total_bytes = (guint64)stvfsbuf.f_frsize * stvfsbuf.f_blocks;
+  guint64 from_mb = repo->min_free_space_mb > 0 ? (guint64)repo->min_free_space_mb << 20 : 0;
+  guint64 from_pct = repo->min_free_space_percent > 0
+                         ? (guint64)((double)total_bytes * (repo->min_free_space_percent / 100.0))
+                         : 0;
+
+  if (from_mb > 0 && from_pct > 0)
+    return MIN (from_mb, from_pct);
+  else if (from_mb > 0)
+    return from_mb;
+  else
+    return from_pct;
+}
+
+static void
+reload_config_with (OstreeRepo *repo, GKeyFile *config, const char *size, const char *percent)
+{
+  g_autoptr (GError) error = NULL;
+  g_key_file_remove_key (config, "core", "min-free-space-size", NULL);
+  g_key_file_remove_key (config, "core", "min-free-space-percent", NULL);
+  if (size != NULL)
+    g_key_file_set_string (config, "core", "min-free-space-size", size);
+  if (percent != NULL)
+    g_key_file_set_string (config, "core", "min-free-space-percent", percent);
+  g_assert_true (ostree_repo_write_config_and_reload (repo, config, &error));
+  g_assert_no_error (error);
+}
+
+static void
+test_repo_get_min_free_space_limits (Fixture *fixture, gconstpointer test_data)
+{
+  g_autoptr (GError) error = NULL;
+  g_autoptr (OstreeRepo) repo = ostree_repo_create_at (
+      fixture->tmpdir.fd, ".", OSTREE_REPO_MODE_ARCHIVE, NULL, NULL, &error);
+  g_assert_no_error (error);
+  g_autoptr (GKeyFile) config = ostree_repo_copy_config (repo);
+  guint64 bytes = 0;
+
+  /* Only min-free-space-size is set; the reserved bytes are exact. */
+  reload_config_with (repo, config, "500MB", NULL);
+  g_assert_cmpuint (repo->min_free_space_percent, ==, 0);
+  g_assert_cmpuint (repo->min_free_space_mb, ==, 500);
+  g_assert_true (ostree_repo_get_min_free_space_bytes (repo, &bytes, &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (bytes, ==, (guint64)500 << 20);
+
+  /* Only min-free-space-percent is set; match the percentage. */
+  reload_config_with (repo, config, NULL, "97");
+  g_assert_cmpuint (repo->min_free_space_percent, ==, 97);
+  g_assert_cmpuint (repo->min_free_space_mb, ==, 0);
+  g_assert_true (ostree_repo_get_min_free_space_bytes (repo, &bytes, &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (bytes, ==, expected_min_free_space_bytes (repo));
+
+  /* Both are set; the smaller of the two limits is enforced. */
+  reload_config_with (repo, config, "500MB", "97");
+  g_assert_cmpuint (repo->min_free_space_percent, ==, 97);
+  g_assert_cmpuint (repo->min_free_space_mb, ==, 500);
+  g_assert_true (ostree_repo_get_min_free_space_bytes (repo, &bytes, &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (bytes, ==, expected_min_free_space_bytes (repo));
+
+  /* Neither is set; the default of min(3%, 1GB) applies. */
+  reload_config_with (repo, config, NULL, NULL);
+  g_assert_cmpuint (repo->min_free_space_percent, ==, 3);
+  g_assert_cmpuint (repo->min_free_space_mb, ==, 1024);
+  g_assert_true (ostree_repo_get_min_free_space_bytes (repo, &bytes, &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (bytes, ==, expected_min_free_space_bytes (repo));
+
+  /* Reloading only a size after the default must clear the stale percent value,
+   * and setting the size to zero disables the check entirely. */
+  reload_config_with (repo, config, "1MB", NULL);
+  g_assert_cmpuint (repo->min_free_space_percent, ==, 0);
+  g_assert_cmpuint (repo->min_free_space_mb, ==, 1);
+  reload_config_with (repo, config, "0MB", NULL);
+  g_assert_cmpuint (repo->min_free_space_percent, ==, 0);
+  g_assert_cmpuint (repo->min_free_space_mb, ==, 0);
+}
+
+static void
+test_min_free_space_dup_content (Fixture *fixture, gconstpointer test_data)
+{
+  g_autoptr (GError) error = NULL;
+
+  g_autoptr (OstreeRepo) repo = ostree_repo_create_at (
+      fixture->tmpdir.fd, ".", OSTREE_REPO_MODE_BARE_USER_ONLY, NULL, NULL, &error);
+  g_assert_no_error (error);
+
+  const guint n_files = 64;
+  const guint file_size = 4096;
+  const guint dup_rounds = 10;
+
+  ostree_repo_prepare_transaction (repo, NULL, NULL, &error);
+  g_assert_no_error (error);
+
+  /* Directly set the free-space budget via the private txn.max_blocks field. Budget for 2x the
+   * blocks that one round of unique writes will reserve. With the bug, 11 rounds would be charged
+   * (1 unique + 10 duplicate), easily exceeding 2x.  With the fix, only the unique round is
+   * charged.
+   */
+  fsblkcnt_t blocks_per_file = (file_size / repo->txn.blocksize) + 1;
+  repo->txn.max_blocks = n_files * blocks_per_file * 2;
+  /* Enable space check by setting a nonzero min_free_space_percent. */
+  repo->min_free_space_percent = 1;
+
+  g_autofree guint8 *buf = g_malloc0 (file_size);
+
+  /* Round 1: write unique objects.  Track checksums to verify each file
+   * produces a distinct content object.
+   */
+  g_autoptr (GHashTable) seen = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  for (guint i = 0; i < n_files; i++)
+    {
+      memcpy (buf, &i, sizeof (i));
+      g_autofree char *checksum = ostree_repo_write_regfile_inline (
+          repo, NULL, 0, 0, S_IFREG | 0644, NULL, buf, file_size, NULL, &error);
+      g_assert_no_error (error);
+      g_assert_nonnull (checksum);
+      g_assert_false (g_hash_table_contains (seen, checksum));
+      g_hash_table_add (seen, g_steal_pointer (&checksum));
+    }
+  g_assert_cmpuint (g_hash_table_size (seen), ==, n_files);
+
+  /* Duplicate rounds: rewrite the exact same objects many times. */
+  for (guint round = 0; round < dup_rounds; round++)
+    {
+      for (guint i = 0; i < n_files; i++)
+        {
+          memcpy (buf, &i, sizeof (i));
+          g_autofree char *checksum = ostree_repo_write_regfile_inline (
+              repo, NULL, 0, 0, S_IFREG | 0644, NULL, buf, file_size, NULL, &error);
+          g_assert_no_error (error);
+          g_assert_nonnull (checksum);
+        }
+    }
+
+  ostree_repo_commit_transaction (repo, NULL, NULL, &error);
+  g_assert_no_error (error);
+}
+
+static GVariant *
+test_xattr_cb (OstreeRepo *repo, const char *path, GFileInfo *file_info, gpointer data)
+{
+  return g_variant_ref ((GVariant *)data);
+}
+
+/* Test that writing content objects that get reflinked does not spuriously trigger the
+ * min-free-space check. This simulates the bootc install-to-filesystem flow where a merged commit
+ * re-writes content with SELinux labels applied.
+ */
+static void
+test_min_free_space_reflinked_content (Fixture *fixture, gconstpointer test_data)
+{
+  g_autoptr (GError) error = NULL;
+
+  /* Check if the filesystem supports reflinks; skip if not. */
+  {
+    g_auto (GLnxTmpfile) tmpf1 = {
+      0,
+    };
+    g_auto (GLnxTmpfile) tmpf2 = {
+      0,
+    };
+    if (!glnx_open_tmpfile_linkable_at (fixture->tmpdir.fd, ".", O_RDWR | O_CLOEXEC, &tmpf1,
+                                        &error))
+      g_assert_no_error (error);
+    (void)glnx_loop_write (tmpf1.fd, "x", 1);
+    if (!glnx_open_tmpfile_linkable_at (fixture->tmpdir.fd, ".", O_RDWR | O_CLOEXEC, &tmpf2,
+                                        &error))
+      g_assert_no_error (error);
+    if (ioctl (tmpf2.fd, FICLONE, tmpf1.fd) < 0)
+      {
+        g_test_skip ("filesystem does not support reflinks");
+        return;
+      }
+  }
+
+  /* Use BARE_USER_ONLY so checkout produces hardlinks to repo objects,
+   * which is what triggers FICLONE in write_content_object. */
+  g_assert_cmpint (mkdirat (fixture->tmpdir.fd, "repo", 0755), ==, 0);
+  glnx_autofd int repo_dfd = -1;
+  if (!glnx_opendirat (fixture->tmpdir.fd, "repo", TRUE, &repo_dfd, &error))
+    g_assert_no_error (error);
+  g_autoptr (OstreeRepo) repo
+      = ostree_repo_create_at (repo_dfd, ".", OSTREE_REPO_MODE_BARE_USER_ONLY, NULL, NULL, &error);
+  g_assert_no_error (error);
+
+  const guint n_files = 64;
+  const guint file_size = 4096;
+
+  /* Round 1: create files on disk and commit them into the repo. */
+  g_assert_cmpint (mkdirat (fixture->tmpdir.fd, "content", 0755), ==, 0);
+  g_autofree guint8 *buf = g_malloc0 (file_size);
+  for (guint i = 0; i < n_files; i++)
+    {
+      memcpy (buf, &i, sizeof (i));
+      g_autofree char *name = g_strdup_printf ("content/file%u", i);
+      glnx_file_replace_contents_at (fixture->tmpdir.fd, name, buf, file_size, 0, NULL, &error);
+      g_assert_no_error (error);
+    }
+
+  ostree_repo_prepare_transaction (repo, NULL, NULL, &error);
+  g_assert_no_error (error);
+  g_autoptr (OstreeMutableTree) mtree = ostree_mutable_tree_new ();
+  ostree_repo_write_dfd_to_mtree (repo, fixture->tmpdir.fd, "content", mtree, NULL, NULL, &error);
+  g_assert_no_error (error);
+  g_autoptr (GFile) root = NULL;
+  ostree_repo_write_mtree (repo, mtree, &root, NULL, &error);
+  g_assert_no_error (error);
+  g_autofree char *commit = NULL;
+  ostree_repo_write_commit (repo, NULL, NULL, NULL, NULL, OSTREE_REPO_FILE (root), &commit, NULL,
+                            &error);
+  g_assert_no_error (error);
+  ostree_repo_transaction_set_ref (repo, NULL, "testref", commit);
+  ostree_repo_commit_transaction (repo, NULL, NULL, &error);
+  g_assert_no_error (error);
+
+  /* Checkout the commit. */
+  OstreeRepoCheckoutAtOptions co_opts = {
+    0,
+  };
+  co_opts.mode = OSTREE_REPO_CHECKOUT_MODE_USER;
+  ostree_repo_checkout_at (repo, &co_opts, fixture->tmpdir.fd, "checkout", commit, NULL, &error);
+  g_assert_no_error (error);
+
+  /* Round 2: re-import the checkout with a modifier that adds an xattr, simulating SELinux
+   * relabeling. The content is identical so FICLONE will share data blocks, but the xattr change
+   * produces new checksums. */
+  ostree_repo_prepare_transaction (repo, NULL, NULL, &error);
+  g_assert_no_error (error);
+
+  /* Set max_blocks budget to half what one round of writes would charge. Without the reflink
+   * credit-back, this would exhaust the budget halfway through. */
+  fsblkcnt_t blocks_per_file = (file_size / repo->txn.blocksize) + 1;
+  repo->txn.max_blocks = n_files * blocks_per_file / 2;
+  repo->min_free_space_percent = 1;
+
+  g_autoptr (OstreeRepoCommitModifier) modifier
+      = ostree_repo_commit_modifier_new (0, NULL, NULL, NULL);
+  GVariantBuilder xattr_builder;
+  g_variant_builder_init (&xattr_builder, G_VARIANT_TYPE ("a(ayay)"));
+  /* Add a fake security.selinux xattr */
+  const char *label = "system_u:object_r:usr_t:s0";
+  g_variant_builder_add (
+      &xattr_builder, "(@ay@ay)", g_variant_new_bytestring ("security.selinux"),
+      g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, label, strlen (label) + 1, 1));
+  g_autoptr (GVariant) xattrs = g_variant_ref_sink (g_variant_builder_end (&xattr_builder));
+  ostree_repo_commit_modifier_set_xattr_callback (modifier, test_xattr_cb, NULL, xattrs);
+
+  g_autoptr (OstreeMutableTree) mtree2 = ostree_mutable_tree_new ();
+  ostree_repo_write_dfd_to_mtree (repo, fixture->tmpdir.fd, "checkout", mtree2, modifier, NULL,
+                                  &error);
+  g_assert_no_error (error);
+
+  ostree_repo_commit_transaction (repo, NULL, NULL, &error);
+  g_assert_no_error (error);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -552,7 +827,13 @@ main (int argc, char **argv)
   g_test_add ("/repo/equal", Fixture, NULL, setup, test_repo_equal, teardown);
   g_test_add ("/repo/get_min_free_space", Fixture, NULL, setup, test_repo_get_min_free_space,
               teardown);
+  g_test_add ("/repo/get_min_free_space_limits", Fixture, NULL, setup,
+              test_repo_get_min_free_space_limits, teardown);
   g_test_add ("/repo/write_regfile_api", Fixture, NULL, setup, test_write_regfile_api, teardown);
+  g_test_add ("/repo/min_free_space_dup_content", Fixture, NULL, setup,
+              test_min_free_space_dup_content, teardown);
+  g_test_add ("/repo/min_free_space_reflinked_content", Fixture, NULL, setup,
+              test_min_free_space_reflinked_content, teardown);
   g_test_add ("/repo/autolock", Fixture, NULL, setup, test_repo_autolock, teardown);
   g_test_add ("/repo/lock/single", Fixture, NULL, lock_setup, test_repo_lock_single, teardown);
   g_test_add ("/repo/lock/unlock-never-locked", Fixture, NULL, lock_setup,

@@ -18,7 +18,7 @@ a content-addressed-object store. It's unlike git in that it "checks out" the
 files via hardlinks, and they thus need to be immutable to prevent corruption.
 Therefore, another way to think of OSTree is that it's just a more polished
 version of
-[Linux VServer hardlinks](http://linux-vserver.org/index.php?title=util-vserver:Vhashify&oldid=2285).
+[Linux VServer hardlinks](http://linux-vserver.at/util-vserver:Vhashify).
 
 **Features:**
 
@@ -51,12 +51,11 @@ projects.
 For Debian/apt, see also https://github.com/stb-tester/apt2ostree
 and the LWN article [Merkle trees and build systems](https://lwn.net/Articles/821367/).
 
-Fedora derivatives use rpm-ostree (noted below); there are 4 variants using OSTree:
+Fedora derivatives use rpm-ostree (noted below):
 
- - [Fedora CoreOS](https://getfedora.org/en/coreos/)
- - [Fedora Silverblue](https://silverblue.fedoraproject.org/)
- - [Fedora Kinoite](https://kinoite.fedoraproject.org/)
- - [Fedora IoT](https://iot.fedoraproject.org/)
+ - [Fedora CoreOS](https://fedoraproject.org/coreos/)
+ - [Fedora Atomic Desktops](https://fedoraproject.org/atomic-desktops/)
+ - [Fedora IoT](https://fedoraproject.org/iot/)
 
 Red Hat Enterprise Linux CoreOS is a derivative of Fedora CoreOS, used in [OpenShift 4](https://try.openshift.com/).
 The [machine-config-operator](https://github.com/openshift/machine-config-operator/blob/master/docs/OSUpgrades.md)

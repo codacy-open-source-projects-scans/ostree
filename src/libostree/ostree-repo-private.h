@@ -222,9 +222,10 @@ struct OstreeRepo
   /* Cache the repo's device/inode to use for comparisons elsewhere */
   dev_t device;
   ino_t inode;
-  uid_t owner_uid;              /* Cache of repo's owner uid */
-  guint min_free_space_percent; /* See the min-free-space-percent config option */
-  guint64 min_free_space_mb;    /* See the min-free-space-size config option */
+  uid_t owner_uid;                     /* Cache of repo's owner uid */
+  guint min_free_space_percent;        /* See the min-free-space-percent config option */
+  guint64 min_free_space_mb;           /* See the min-free-space-size config option */
+  gboolean min_free_space_use_percent; /* See the min-free-space-percent config option */
   guint64 reserved_blocks;
   gboolean cleanup_stagedir;
 
@@ -360,7 +361,8 @@ gboolean _ostree_repo_import_object (OstreeRepo *self, OstreeRepo *source, Ostre
 
 gboolean _ostree_repo_commit_tmpf_final (OstreeRepo *self, const char *checksum,
                                          OstreeObjectType objtype, GLnxTmpfile *tmpf,
-                                         GCancellable *cancellable, GError **error);
+                                         gboolean *out_existed, GCancellable *cancellable,
+                                         GError **error);
 
 typedef struct
 {
@@ -467,7 +469,7 @@ OstreeRepoAutoTransaction *_ostree_repo_auto_transaction_new (OstreeRepo *repo);
 
 typedef struct OstreeComposefsTarget OstreeComposefsTarget;
 
-GType ostree_composefs_target_get_type (void) G_GNUC_CONST;
+GType ostree_composefs_target_get_type (void);
 OstreeComposefsTarget *ostree_composefs_target_new (void);
 OstreeComposefsTarget *ostree_composefs_target_ref (OstreeComposefsTarget *target);
 void ostree_composefs_target_unref (OstreeComposefsTarget *target);

@@ -226,6 +226,12 @@ ostree_validate_rev (const char *rev, GError **error)
 {
   g_autoptr (GMatchInfo) match = NULL;
 
+  g_return_val_if_fail (rev != NULL, FALSE);
+
+  /* Validate the string is valid UTF-8 */
+  if (!g_utf8_validate (rev, -1, NULL))
+    return glnx_throw (error, "Invalid ref name: not valid UTF-8");
+
   static gsize regex_initialized;
   static GRegex *regex;
   if (g_once_init_enter (&regex_initialized))
@@ -1633,9 +1639,7 @@ _ostree_loose_path (char *buf, const char *checksum, OstreeObjectType objtype, O
 
 /**
  * _ostree_stbuf_to_gfileinfo:
- * @mode: File mode
- * @uid: File uid
- * @gid: File gid
+ * @stbuf: File stat buffer
  *
  * OSTree only stores a subset of file attributes; for example,
  * timestamps are intentionally not stored.  This function creates a
@@ -2345,7 +2349,6 @@ _ostree_validate_structureof_xattrs (GVariant *xattrs, GError **error)
                                previous, name, i);
         }
       previous = name;
-      i++;
     }
   return TRUE;
 }

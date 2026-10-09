@@ -29,3 +29,5 @@ global:
   someostree_symbol_deleteme;
 } LIBOSTREE_$YEAR.$LASTSTABLE;
 */
+
+/* No new symbols yet for next development version */

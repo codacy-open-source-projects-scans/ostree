@@ -23,8 +23,6 @@
 
 G_BEGIN_DECLS
 
-/* Arbitrarily chosen */
-#define OSTREE_STATIC_DELTA_PART_MAX_SIZE_BYTES (16 * 1024 * 1024)
 /* 1 byte for object type, 32 bytes for checksum */
 #define OSTREE_STATIC_DELTA_OBJTYPE_CSUM_LEN 33
 
